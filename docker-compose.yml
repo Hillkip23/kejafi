@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - KEJAFI_PROD_KEY=${KEJAFI_PROD_KEY:-prod_key_placeholder}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
