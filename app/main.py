@@ -7,6 +7,7 @@ v0.4.0 changes:
 - Adds token registration endpoint for post-deployment address updates
 - Adds lookup by token symbol for frontend integration
 - Returns token_address/pool_address in property responses for Web3 integration
+- Added demo data fallback for risk endpoints (no metro_lab_core required)
 """
 
 import os
@@ -37,12 +38,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://localhost:3001",  # Next.js alternate port
+        "http://localhost:3001",
         "http://localhost:8501",
         "http://localhost:8506",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:8501",
         "http://127.0.0.1:8506",
+        "https://kejafi-api.onrender.com",
+        "https://kejafi.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -65,50 +68,58 @@ def require_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
 
 
 # =========================================================
-# Token Registration Schema (NEW)
+# Token Registration Schema
 # =========================================================
 
 class TokenRegistration(BaseModel):
-    token_address: str  # ERC-20 contract address (e.g., FINE5 or FINE6)
-    pool_address: Optional[str] = None  # Uniswap/FinePool address
-    chain_id: int = 11155111  # Default Sepolia
-    token_symbol: Optional[str] = None  # FINE5 or FINE6
+    token_address: str
+    pool_address: Optional[str] = None
+    chain_id: int = 11155111
+    token_symbol: Optional[str] = None
 
 
 # =========================================================
-# Engine helpers (unchanged)
+# Demo data for risk endpoints (FALLBACK when metro_lab_core unavailable)
 # =========================================================
+
+def _get_demo_series(metro: str):
+    """Generate synthetic rent data for demo purposes"""
+    import pandas as pd
+    import numpy as np
+    
+    dates = pd.date_range('2015-01-01', periods=120, freq='MS')
+    base_rent = 1500
+    monthly_growth = 0.0025
+    trend = 1 + (np.arange(120) * monthly_growth)
+    np.random.seed(42)
+    noise = np.random.normal(1, 0.02, 120)
+    values = base_rent * trend * noise
+    return pd.Series(values, index=dates)
+
 
 def _get_metro_series(metro: str):
+    """Get ZORI rent series for a metro, or return synthetic demo data"""
     try:
         from metro_lab_core import get_series, ZORI_REGION_MAP
         series = get_series(metro)
         if series is None:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"No ZORI series for '{metro}'. "
-                    f"Available: {list(ZORI_REGION_MAP.keys())}"
-                ),
-            )
+            return _get_demo_series(metro)
         return series
-    except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="metro_lab_core not on Python path.",
-        )
+    except (ImportError, FileNotFoundError, Exception):
+        return _get_demo_series(metro)
 
 
 def _get_metro_fundamentals(metro: str) -> dict:
+    """Get metro fundamentals or return demo data"""
     try:
         from metro_lab_core import get_metro_fundamentals
         return get_metro_fundamentals(metro)
     except Exception:
         return {
-            "pci_2023": None,
-            "pop_growth": None,
-            "metro_elasticity": None,
-            "supply_bucket": None,
+            "pci_2023": 75000,
+            "pop_growth": 0.08,
+            "metro_elasticity": 0.35,
+            "supply_bucket": "neutral",
         }
 
 
@@ -141,7 +152,7 @@ def _severity_score(results: dict) -> int:
 
 
 # =========================================================
-# ORM helpers (unchanged)
+# ORM helpers
 # =========================================================
 
 def _orm_to_out(row: PropertyORM) -> PropertyOut:
@@ -192,14 +203,13 @@ def _get_or_404(prop_id: str, db: Session) -> PropertyORM:
 
 
 # =========================================================
-# Startup seed (UPDATED: Added Property B)
+# Startup seed
 # =========================================================
 
 @app.on_event("startup")
 def seed_db():
     db = next(get_db())
     try:
-        # Property A (FINE5) - already existed
         if db.query(PropertyORM).filter(PropertyORM.id == "charlotte_mfk_001").first() is None:
             db.add(PropertyORM(
                 id="charlotte_mfk_001",
@@ -217,8 +227,8 @@ def seed_db():
                 supply_bucket=None,
                 risk_score=75.0,
                 risk_bucket="Moderate",
-                token_symbol="FINE5",  # Matches your frontend
-                token_price=5.48,  # NAV per token
+                token_symbol="FINE5",
+                token_price=5.48,
                 total_supply=100_000,
                 lockup_months=12,
                 nav_total=548_000.0,
@@ -232,15 +242,13 @@ def seed_db():
                 fee_tier=0.003,
                 price_range_low=4.66,
                 price_range_high=6.30,
-                # Token addresses will be added via /tokens endpoint after deployment
-                token_address=None,
-                chain_id=11155111,  # Sepolia
-                pool_address=None,
+                token_address="0x0FB987BEE67FD839cb1158B0712d5e4Be483dd2E",
+                chain_id=11155111,
+                pool_address="0x0Bf78f76c86153E433dAA5Ac6A88453D30968e27",
                 is_published=True,
                 public_url="https://app.kejafi.com/properties/charlotte_mfk_001",
             ))
         
-        # Property B (FINE6) - NEW
         if db.query(PropertyORM).filter(PropertyORM.id == "charlotte_mfk_002").first() is None:
             db.add(PropertyORM(
                 id="charlotte_mfk_002",
@@ -258,7 +266,7 @@ def seed_db():
                 supply_bucket=None,
                 risk_score=72.0,
                 risk_bucket="Moderate",
-                token_symbol="FINE6",  # Matches your frontend
+                token_symbol="FINE6",
                 token_price=5.76,
                 total_supply=100_000,
                 lockup_months=12,
@@ -286,7 +294,7 @@ def seed_db():
 
 
 # =========================================================
-# Health (unchanged)
+# Health
 # =========================================================
 
 @app.get("/health")
@@ -295,7 +303,7 @@ def health():
 
 
 # =========================================================
-# Analytics endpoints (unchanged)
+# Analytics endpoints (with demo data fallback)
 # =========================================================
 
 @app.get("/risk/{metro}")
@@ -501,21 +509,12 @@ def get_property(prop_id: str, db: Session = Depends(get_db)):
 
 @app.get("/tokens/", response_model=List[PropertyOut])
 def list_tokens(db: Session = Depends(get_db)):
-    """List all published properties with token info"""
     rows = db.query(PropertyORM).filter(PropertyORM.is_published == True).all()
     return [_orm_to_out(r) for r in rows]
 
 
-# =========================================================
-# NEW: Token lookup by symbol (for frontend Web3 integration)
-# =========================================================
-
 @app.get("/tokens/by-symbol/{symbol}", response_model=PropertyOut)
 def get_token_by_symbol(symbol: str, db: Session = Depends(get_db)):
-    """
-    Lookup property by token symbol (e.g., FINE5, FINE6).
-    Returns property with token_address for Web3 integration.
-    """
     row = (
         db.query(PropertyORM)
         .filter(PropertyORM.token_symbol == symbol.upper())
@@ -531,7 +530,7 @@ def get_token_by_symbol(symbol: str, db: Session = Depends(get_db)):
 
 
 # =========================================================
-# NEW: Register/update token addresses after deployment
+# Token registration (API key required)
 # =========================================================
 
 @app.post(
@@ -544,10 +543,6 @@ def register_tokens(
     registration: TokenRegistration,
     db: Session = Depends(get_db),
 ):
-    """
-    Register or update token contract addresses after deploying to Sepolia/Mainnet.
-    Call this after deploying FINE5/FINE6 ERC-20 contracts and Uniswap pool.
-    """
     row = _get_or_404(prop_id, db)
     
     row.token_address = registration.token_address
@@ -572,7 +567,6 @@ def update_token_addresses(
     registration: TokenRegistration,
     db: Session = Depends(get_db),
 ):
-    """Alias for POST /tokens - updates token contract addresses"""
     return register_tokens(prop_id, registration, db)
 
 
@@ -629,7 +623,7 @@ def delete_property(prop_id: str, db: Session = Depends(get_db)):
 
 
 # =========================================================
-# Swaps (unchanged)
+# Swaps
 # =========================================================
 
 class SwapIntent(BaseModel):
