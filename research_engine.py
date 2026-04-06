@@ -65,7 +65,6 @@ ZORI_PATH = DATA_DIR / "Zillow_Observed_Rent_Index.csv"
 FIG_DIR = BASE_DIR / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
-st.set_page_config(page_title="Kejafi Research Engine", layout="wide")
 
 
 @st.cache_data
