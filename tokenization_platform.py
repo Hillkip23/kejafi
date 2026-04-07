@@ -3,36 +3,31 @@
 Kejafi Single-Asset Tokenization Platform
 Stage 2: Select a property, run valuation with metro fundamentals, publish to API.
 
-Fixes applied:
-1. pop_growth None guard  — full_valuation no longer throws TypeError when
-   metro profile is unavailable and pop_growth is None.
-2. IRR calculation        — replaced CAGR proxy with a proper Newton-Raphson
-   IRR solve on the full cash-flow series (initial equity outflow + annual
-   levered cash flows + exit equity proceeds).
-3. API None fields        — push_property_to_api coerces None numeric fields
-   to safe defaults before POST so FastAPI never receives null numerics.
-4. resolve_metro_label_for_property caching — wrapped in @st.cache_data so
-   load_zori() is only called once per session rather than on every re-render.
-5. session_state key namespacing — keys renamed to "stage2_valuation",
-   "stage2_property", "stage2_market" to avoid cross-page collisions.
-6. rent_volatility noted  — added comment documenting that it is available in
-   the market dict but not consumed by Stage 2 valuation (reserved for Stage 3
-   Monte Carlo extension).
-7. Stage 1 integration    — imports export_metro_for_stage2 from research_engine
-   and adds UI to pull metro risk data from Stage 1 session state.
+Fixes applied (v2):
+1. Dynamic token symbol – derived from property ID, editable by user.
+2. API URL from environment variable KEJAFI_API_URL (default http://127.0.0.1:8000).
+3. API key from st.secrets (Streamlit Cloud) or environment variable.
+4. Token registration UI – allows updating token_address and pool_address after deployment.
+5. Proper handling of pop_growth (no longer None from Stage 1).
+6. Added explicit Stage 1 import preview and validation.
 """
 
+import streamlit as st
+
+# This MUST be the first Streamlit command - ONLY ONE
+st.set_page_config(page_title="Kejafi Single-Asset Tokenization", layout="wide")
+
 import math
+import os
+import json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import matplotlib.pyplot as plt
 import requests
-import os
 
 # Stage 1 integration: Import the export pipeline
 try:
@@ -47,16 +42,22 @@ from metro_lab_core import build_metro_profile, load_zori  # Stage 1 helpers
 # Setup
 # =========================================================
 
-st.set_page_config(page_title="Kejafi Single-Asset Tokenization", layout="wide")
-
 BASE_DIR = Path(__file__).resolve().parent
-API_URL = "http://127.0.0.1:8000"
+
+# API configuration – read from environment or use default
+API_URL = os.getenv("KEJAFI_API_URL", "http://127.0.0.1:8000")
+
+# API key – prefer Streamlit secrets, then environment variable
+if "KEJAFI_PROD_KEY" in st.secrets:
+    API_KEY = st.secrets["KEJAFI_PROD_KEY"]
+else:
+    API_KEY = os.getenv("KEJAFI_PROD_KEY", "prod_key_placeholder")
 
 FIG_DIR = BASE_DIR / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
 # =========================================================
-# Dynamic metro mapping helper
+# Dynamic metro mapping helper (cached)
 # =========================================================
 
 @st.cache_data
@@ -90,7 +91,7 @@ def resolve_metro_label_for_property(raw_metro_label: str) -> str:
 
 
 # =========================================================
-# IRR solver (FIX 2)
+# IRR solver (Newton-Raphson)
 # =========================================================
 
 def compute_irr(cash_flows: List[float], guess: float = 0.10) -> float:
@@ -256,7 +257,6 @@ class PropertyValuation:
 
         zori_yoy = self.market["yoy_rent_growth"]
 
-        
         pop_g: Optional[float] = self.market.get("pop_growth")
         growth_adj = 0.0
         if pop_g is not None:
@@ -307,7 +307,7 @@ class PropertyValuation:
 
 
 # =========================================================
-# FastAPI publish helper
+# FastAPI publish helper (UPDATED)
 # =========================================================
 
 def _coerce(value, default=0.0):
@@ -320,7 +320,12 @@ def push_property_to_api(
     valuation: ValuationResult,
     market: Dict,
     prop: Dict,
+    token_symbol: str,
 ):
+    """
+    Publish property to FastAPI.
+    token_symbol is now dynamic (user-provided or derived).
+    """
     tokenized_equity_fraction = 0.8
     total_supply = 100_000
 
@@ -345,7 +350,7 @@ def push_property_to_api(
         "irr": valuation.irr_projected,
         "equity_multiple": valuation.equity_multiple,
 
-        # Metro fundamentals — None → 0.0 / "unknown" so API never gets null
+        # Metro fundamentals — None → 0.0 / "unknown"
         "pci_2023": _coerce(market.get("pci_2023"), 0.0),
         "pop_growth": _coerce(market.get("pop_growth"), 0.0),
         "metro_elasticity": _coerce(market.get("metro_elasticity"), 0.0),
@@ -355,8 +360,8 @@ def push_property_to_api(
         "risk_score": _coerce(market.get("risk_score"), 0.0),
         "risk_bucket": market.get("risk_bucket") or "unknown",
 
-        # Tokenization terms
-        "token_symbol": "KJFI01",
+        # Tokenization terms – NOW DYNAMIC
+        "token_symbol": token_symbol,
         "token_price": initial_price,
         "total_supply": total_supply,
         "lockup_months": 12,
@@ -378,16 +383,18 @@ def push_property_to_api(
 
         # On-chain metadata (populated after deployment)
         "token_address": None,
-        "chain_id": None,
+        "chain_id": 11155111,  # Sepolia default
         "pool_address": None,
     }
+
+    headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
     try:
         r = requests.post(
             f"{API_URL}/properties/",
             json=payload,
             timeout=10,
-            headers={"X-API-Key": os.environ.get("KEJAFI_PROD_KEY", "prod_key_placeholder")},
+            headers=headers,
         )
         r.raise_for_status()
         return r.json()
@@ -403,28 +410,50 @@ def push_property_to_api(
         )
 
 
+def register_token_addresses(prop_id: str, token_address: str, pool_address: str, chain_id: int = 11155111):
+    """Call POST /properties/{prop_id}/tokens to update on-chain addresses."""
+    headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "token_address": token_address,
+        "pool_address": pool_address,
+        "chain_id": chain_id,
+        "token_symbol": None,  # keep existing
+    }
+    try:
+        r = requests.post(
+            f"{API_URL}/properties/{prop_id}/tokens",
+            json=payload,
+            timeout=10,
+            headers=headers,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        raise Exception(f"Token registration failed: {e}")
+
+
 # =========================================================
-# Stage 1 Integration UI
+# Stage 1 Integration UI (unchanged, but improved display)
 # =========================================================
 
 def render_stage1_import():
     """UI component to import metro risk data from Stage 1 session state."""
-    st.subheader("Import from Stage 1 (Research Engine)")
-    
+    st.subheader("📥 Import from Stage 1 (Research Engine)")
+
     if not HAS_STAGE1:
         st.warning("Stage 1 (research_engine.py) not found. Run Stage 1 analysis first.")
         return None
-    
+
     # Check for Stage 1 results in session state
     has_stage1_data = (
-        "stage1_result_a" in st.session_state or 
+        "stage1_result_a" in st.session_state or
         "stage1_result_b" in st.session_state
     )
-    
+
     if not has_stage1_data:
         st.info("No Stage 1 data found. Run Stage 1 analysis first, then return here.")
         return None
-    
+
     # Let user select which metro to import
     options = []
     if "stage1_result_a" in st.session_state:
@@ -433,35 +462,35 @@ def render_stage1_import():
     if "stage1_result_b" in st.session_state:
         metro_b = st.session_state.get("stage1_metro_b_short", "Metro B")
         options.append((metro_b, "b"))
-    
+
     selected = st.selectbox(
         "Select Stage 1 Metro Analysis",
         options,
         format_func=lambda x: f"{x[0]} (from Stage 1 session)",
     )
-    
+
     if st.button("Import Market Data", type="primary"):
         suffix = selected[1]
         result_key = f"stage1_result_{suffix}"
         county_key = f"stage1_county_{suffix}"
         metro_key = f"stage1_metro_{suffix}_short"
-        
+
         result = st.session_state[result_key]
         county = st.session_state.get(county_key)
         metro_short = st.session_state.get(metro_key, selected[0])
-        
+
         # Convert to Stage 2 format
         market = export_metro_for_stage2(metro_short, result, county)
-        
+
         # Store in Stage 2 namespaced session state
         st.session_state["stage2_imported_market"] = market
         st.session_state["stage2_imported_metro"] = metro_short
-        
+
         st.success(f"Imported {metro_short} market data from Stage 1!")
         st.json(market)
-        
+
         return market
-    
+
     # Return previously imported data if available
     return st.session_state.get("stage2_imported_market")
 
@@ -470,7 +499,7 @@ def render_stage1_import():
 # Streamlit UI
 # =========================================================
 
-st.title("\U0001f3e0 Kejafi Single-Asset Tokenization Platform")
+st.title("🏘️ Kejafi Single-Asset Tokenization Platform")
 
 st.markdown(
     "**Stage 2: Select a property in a metro, run valuation with metro fundamentals, "
@@ -478,7 +507,7 @@ st.markdown(
 )
 
 # ----------------------------------------------------------
-# Step 0: Stage 1 Import (NEW)
+# Step 0: Stage 1 Import
 # ----------------------------------------------------------
 st.header("Step 0: Import Metro Risk Data (Optional)")
 imported_market = render_stage1_import()
@@ -545,24 +574,24 @@ with col2:
             )
             market: Dict = {
                 "yoy_rent_growth": 0.03,
-                "rent_volatility": 0.08,   # reserved for Stage 3 Monte Carlo
+                "rent_volatility": 0.08,
                 "trend_label": "stable",
                 "pci_2023": None,
                 "metro_elasticity": None,
                 "supply_bucket": None,
-                "pop_growth": None,        # FIX 1: stays None; full_valuation guards it
+                "pop_growth": 0.05,       # default, not None
                 "risk_score": 75.0,
                 "risk_bucket": "Moderate",
             }
         else:
             market = {
                 "yoy_rent_growth":  metro_profile["yoy_rent_growth"],
-                "rent_volatility":  metro_profile["rent_volatility"],   # Stage 3 use
+                "rent_volatility":  metro_profile["rent_volatility"],
                 "trend_label":      metro_profile["trend_label"],
                 "pci_2023":         metro_profile["pci_2023"],
                 "metro_elasticity": metro_profile["metro_elasticity"],
                 "supply_bucket":    metro_profile["supply_bucket"],
-                "pop_growth":       metro_profile["pop_growth"],
+                "pop_growth":       metro_profile.get("pop_growth", 0.05),  # ensure not None
                 "risk_score":       metro_profile["risk_score"],
                 "risk_bucket":      metro_profile["risk_bucket"],
             }
@@ -591,7 +620,7 @@ with col2:
         c5.metric("Housing elasticity", "n/a")
 
     c6.metric(
-        "Pop growth 13\u201317\u219218\u201322",
+        "Pop growth 13–17→18–22",
         f"{market['pop_growth']*100:.1f}%"
         if market["pop_growth"] is not None
         else "n/a",
@@ -623,16 +652,16 @@ with col_v2:
 with col_v3:
     hold_period = st.slider("Hold Period (years)", 3, 10, 5, 1)
 
-if st.button("\U0001f3af Run Valuation", type="primary"):
+if st.button("🏆 Run Valuation", type="primary"):
     val_engine = PropertyValuation(prop, market)
     valuation = val_engine.full_valuation(leverage, interest_rate, hold_period)
 
-    # FIX 5: namespaced session state keys to avoid cross-page collisions
+    # Store in session state (namespaced)
     st.session_state["stage2_valuation"] = valuation
     st.session_state["stage2_property"] = prop
     st.session_state["stage2_market"] = market
 
-    st.success("Valuation complete (metro assumptions from Stage 1).")
+    st.success("Valuation complete.")
 
     r1, r2, r3, r4 = st.columns(4)
     r1.metric("Stabilized NOI",  f"${valuation.noi:,.0f}")
@@ -649,7 +678,7 @@ if st.button("\U0001f3af Run Valuation", type="primary"):
 
     st.subheader("Valuation vs. list price")
     fig, ax = plt.subplots(figsize=(10, 4))
-    categories = ["List price", "Income value", "Value/door \u00d7 units"]
+    categories = ["List price", "Income value", "Value/door × units"]
     values = [
         valuation.list_price / 1000,
         valuation.value_income / 1000,
@@ -672,27 +701,69 @@ if st.button("\U0001f3af Run Valuation", type="primary"):
     st.pyplot(fig)
 
 # ----------------------------------------------------------
-# Step 3: Publish to FastAPI
+# Step 3: Publish to FastAPI (with dynamic token symbol)
 # ----------------------------------------------------------
 if "stage2_valuation" in st.session_state:
     st.header("Step 3: Publish to Marketplace API")
+
+    # Dynamic token symbol input
+    default_symbol = f"FINE{selected_key[-3:]}" if selected_key.endswith("001") else "FINE5"
+    token_symbol = st.text_input("Token Symbol (e.g., FINE5, FINE6)", value=default_symbol)
+
     st.markdown(
-        "Pushes a unified property object (metro fundamentals + risk, valuation, "
-        "token terms) to the FastAPI backend for the investor frontend."
+        "Pushes property + valuation + token terms to the FastAPI backend. "
+        "The frontend will use the token symbol to fetch contract addresses."
     )
 
-    if st.button("\U0001f4e1 Publish to API"):
+    if st.button("📡 Publish to API"):
         valuation = st.session_state["stage2_valuation"]
         prop      = st.session_state["stage2_property"]
         market    = st.session_state["stage2_market"]
         try:
-            res = push_property_to_api(selected_key, valuation, market, prop)
-            st.success("Published to API.")
+            res = push_property_to_api(selected_key, valuation, market, prop, token_symbol)
+            st.success(f"Published to API with token symbol {token_symbol}.")
             st.write("Public URL (used by the Next.js frontend):")
             st.code(res.get("public_url", ""), language="text")
             st.json(res)
+
+            # Store property ID and token symbol for later registration
+            st.session_state["last_published_prop_id"] = selected_key
+            st.session_state["last_published_token_symbol"] = token_symbol
         except Exception as e:
             st.error(f"Failed to publish: {e}")
+
+# ----------------------------------------------------------
+# Step 4: Register token addresses (after deployment)
+# ----------------------------------------------------------
+if "last_published_prop_id" in st.session_state:
+    st.header("Step 4: Register On-Chain Addresses (Optional)")
+
+    prop_id = st.session_state["last_published_prop_id"]
+    token_sym = st.session_state.get("last_published_token_symbol", "Unknown")
+
+    st.markdown(
+        f"After deploying the **{token_sym}** ERC-20 contract and Uniswap pool on Sepolia, "
+        "register the addresses here so the frontend can swap."
+    )
+
+    col_addr, col_pool = st.columns(2)
+    with col_addr:
+        token_address = st.text_input("Token Contract Address", placeholder="0x...")
+    with col_pool:
+        pool_address = st.text_input("Uniswap Pool Address", placeholder="0x... (optional)")
+
+    chain_id = st.selectbox("Chain ID", [11155111, 1], format_func=lambda x: "Sepolia" if x == 11155111 else "Ethereum Mainnet")
+
+    if st.button("Register Addresses", type="secondary"):
+        if not token_address:
+            st.error("Token address is required.")
+        else:
+            try:
+                updated = register_token_addresses(prop_id, token_address, pool_address, chain_id)
+                st.success("Token addresses registered successfully!")
+                st.json(updated)
+            except Exception as e:
+                st.error(f"Registration failed: {e}")
 
 st.markdown("---")
 st.caption(
